@@ -44,7 +44,7 @@ export default {
         subUser = subUser.slice(5);
         try {
           const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
-          if (user && user.connection_type === atob('dmxlc3M=')) {
+          if (user && user.connection_type === atob('dmxlc3M=') && user.is_active === 1) {
             const host = url.hostname;
             let ips = [host];
             if (user.ips) {
@@ -170,7 +170,7 @@ export default {
         // هندلر ساب متنی مخدوش‌شده با ترفند تزریق نویز
         try {
           const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
-          if (user && user.connection_type === atob('dmxlc3M=')) {
+          if (user && user.connection_type === atob('dmxlc3M=') && user.is_active === 1) {
             const host = url.hostname;
             let ips = [host];
             if (user.ips) {
@@ -262,6 +262,43 @@ export default {
         return new Response(JSON.stringify({ error: err instanceof Error ? err.message : "Unknown error" }), { 
           status: 500, 
           headers: { "Content-Type": "application/json; charset=utf-8" } 
+        });
+      }
+    }
+
+    // API: تغییر رمز عبور پنل
+    if (url.pathname === '/api/change-password' && request.method === 'POST') {
+      const authorized = await verifyApiAuth(request, env);
+      if (!authorized) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { 
+          status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } 
+        });
+      }
+      try {
+        const { oldPassword, newPassword } = await request.json();
+        const storedHash = await getPanelPassword(env.DB);
+        const hashedOld = await sha256(oldPassword);
+        if (storedHash !== hashedOld) {
+          return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), { 
+            status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } 
+          });
+        }
+        if (!newPassword || newPassword.length < 4) {
+          return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), { 
+            status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } 
+          });
+        }
+        const hashedNew = await sha256(newPassword);
+        await setPanelPassword(env.DB, hashedNew);
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { 
+            "Content-Type": "application/json; charset=utf-8",
+            "Set-Cookie": "panel_session=" + hashedNew + "; Path=/; HttpOnly; Secure; SameSite=Lax"
+          }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err instanceof Error ? err.message : "Unknown error" }), { 
+          status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } 
         });
       }
     }
@@ -377,6 +414,67 @@ export default {
       });
     }
 
+    if (url.pathname.startsWith('/status/')) {
+      const uuid = url.pathname.slice(8);
+      try {
+        const user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuid).first();
+        if (!user) return new Response("Not Found", { status: 404 });
+        
+        const created = user.created_at ? new Date(user.created_at) : null;
+        let expiryText = 'نامحدود';
+        if (user.expiry_days && created) {
+           const expiryDate = new Date(created.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
+           const remaining = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+           expiryText = remaining > 0 ? remaining + ' روز' : 'منقضی شده';
+        }
+        
+        const html = `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>وضعیت حساب | ${user.username}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
+    <script>
+        tailwind.config = { darkMode: 'class', theme: { extend: { fontFamily: { sans: ['Vazirmatn', 'sans-serif'] }, colors: { amoled: { bg: '#000000', card: '#0a0a0a', border: '#1f1f1f' } } } } }
+    </script>
+    <style>body { font-family: 'Vazirmatn', sans-serif; }</style>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl p-6 relative overflow-hidden">
+        <div class="absolute top-0 right-0 w-32 h-32 bg-blue-500/10 rounded-full blur-3xl -mr-16 -mt-16"></div>
+        <div class="absolute bottom-0 left-0 w-32 h-32 bg-purple-500/10 rounded-full blur-3xl -ml-16 -mb-16"></div>
+        <h2 class="text-2xl font-bold mb-6 text-center text-blue-600 dark:text-blue-500 relative z-10">وضعیت حساب کاربر</h2>
+        <div class="space-y-4 relative z-10">
+            <div class="flex justify-between items-center py-3 border-b dark:border-gray-800/50">
+                <span class="text-gray-500 dark:text-gray-400">نام کاربری:</span>
+                <span class="font-bold text-lg">${user.username}</span>
+            </div>
+            <div class="flex justify-between items-center py-3 border-b dark:border-gray-800/50">
+                <span class="text-gray-500 dark:text-gray-400">وضعیت سرویس:</span>
+                <span class="px-3 py-1 rounded-full text-xs font-bold shadow-sm ${user.is_active ? 'bg-green-100 text-green-700 dark:bg-green-500/20 dark:text-green-400' : 'bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-400'}">
+                    ${user.is_active ? 'فعال' : 'غیرفعال'}
+                </span>
+            </div>
+            <div class="flex justify-between items-center py-3 border-b dark:border-gray-800/50">
+                <span class="text-gray-500 dark:text-gray-400">حجم مصرفی:</span>
+                <span class="font-bold" dir="ltr">${user.used_gb ? user.used_gb.toFixed(2) : 0} GB <span class="text-sm font-normal text-gray-400 mx-1">از</span> ${user.limit_gb ? user.limit_gb + ' GB' : 'نامحدود'}</span>
+            </div>
+            <div class="flex justify-between items-center py-3">
+                <span class="text-gray-500 dark:text-gray-400">اعتبار باقی‌مانده:</span>
+                <span class="font-bold">${expiryText}</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>`;
+        return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      } catch(e) {
+        return new Response("Error", { status: 500 });
+      }
+    }
+
     // بررسی احراز هویت برای بقیه APIها
     if (url.pathname.startsWith('/api/users')) {
       const authorized = await verifyApiAuth(request, env);
@@ -385,6 +483,25 @@ export default {
           status: 401, 
           headers: { "Content-Type": "application/json; charset=utf-8" } 
         });
+      }
+
+      // API POST: تغییر وضعیت فعال/غیرفعال کاربر
+      if (url.pathname.match(/^\/api\/users\/[^\/]+\/toggle$/) && request.method === 'POST') {
+        try {
+          const pathParts = url.pathname.split('/');
+          const username = decodeURIComponent(pathParts[3]);
+          const user = await env.DB.prepare("SELECT is_active FROM users WHERE username = ?").bind(username).first();
+          if (user) {
+             const newStatus = user.is_active === 1 ? 0 : 1;
+             await env.DB.prepare("UPDATE users SET is_active = ? WHERE username = ?").bind(newStatus, username).run();
+             return new Response(JSON.stringify({ success: true, is_active: newStatus }), {
+                headers: { "Content-Type": "application/json; charset=utf-8" }
+             });
+          }
+          return new Response("Not Found", { status: 404 });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: "Error" }), { status: 500 });
+        }
       }
 
       // API PUT: ویرایش کاربر در دیتابیس D1
@@ -1622,6 +1739,9 @@ const htmlTemplate = `
                 </button>
                 
                                                 <!-- دکمه تنظیمات پنل -->
+                <button onclick="togglePasswordModal(true)" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition text-gray-600 dark:text-gray-300 shadow-sm" title="تغییر رمز عبور">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4v-3.286l7.464-7.464A6 6 0 1115 9v.01z"></path></svg>
+                </button>
                 <button onclick="toggleSettingsModal(true)" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition text-gray-600 dark:text-gray-300 shadow-sm" title="تنظیمات پنل">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
                 </button>
@@ -1714,7 +1834,17 @@ const htmlTemplate = `
     <div id="loading-state" class="text-center py-12">
         <span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
     </div>
-    <h2 class="text-lg font-bold mb-4 text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
+    <div class="flex flex-col sm:flex-row justify-between items-center mb-4 gap-4">
+                <h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
+                <div class="flex flex-col sm:flex-row gap-3 w-full sm:w-auto">
+                    <input type="text" id="search-input" placeholder="جستجو (نام کاربری)..." onkeyup="applyFilters()" class="w-full sm:w-64 px-3 py-2 bg-gray-50 border border-gray-200 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 dark:bg-amoled-input dark:border-amoled-border dark:placeholder-gray-400 dark:text-zinc-100 dark:focus:ring-blue-500 dark:focus:border-blue-500 transition shadow-sm">
+                    <select id="status-filter" onchange="applyFilters()" class="w-full sm:w-auto px-3 py-2 bg-gray-50 border border-gray-200 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 dark:bg-amoled-input dark:border-amoled-border dark:text-zinc-100 transition shadow-sm">
+                        <option value="all">همه وضعیت‌ها</option>
+                        <option value="active">فعال</option>
+                        <option value="inactive">غیرفعال</option>
+                    </select>
+                </div>
+            </div>
             <div id="users-table-container" class="hidden overflow-x-auto border border-gray-200 dark:border-amoled-border rounded-xl bg-white dark:bg-amoled-card">
                 <table class="w-full text-right border-collapse">
                     <thead>
@@ -1800,6 +1930,34 @@ const htmlTemplate = `
                 <div id="qrcode-box" class="flex justify-center items-center w-48 h-48 mx-auto"></div>
             </div>
             <button onclick="toggleQRModal(false)" class="w-full py-2 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 font-medium rounded-lg text-sm transition text-gray-900 dark:text-zinc-100">بستن</button>
+        </div>
+    </div>
+
+
+    <!-- مودال تغییر رمز عبور -->
+    <div id="password-modal" class="fixed inset-0 z-50 flex items-center justify-center hidden opacity-0 transition-opacity duration-300">
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="togglePasswordModal(false)"></div>
+        <div class="bg-white dark:bg-amoled-card w-full max-w-sm rounded-2xl shadow-2xl z-10 p-6 transform scale-95 opacity-0 transition-all duration-300 border border-gray-200 dark:border-amoled-border m-4">
+            <div class="flex justify-between items-center mb-5 pb-4 border-b border-gray-100 dark:border-zinc-800">
+                <h3 class="font-bold text-gray-900 dark:text-zinc-100">تغییر رمز عبور</h3>
+                <button onclick="togglePasswordModal(false)" class="text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200 transition">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-zinc-300 mb-1">رمز عبور فعلی</label>
+                    <input type="password" id="old-password" dir="ltr" class="w-full px-4 py-2 border border-gray-200 dark:border-amoled-border rounded-lg bg-gray-50 dark:bg-amoled-input text-gray-900 dark:text-zinc-100 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-zinc-300 mb-1">رمز عبور جدید</label>
+                    <input type="password" id="new-password" dir="ltr" class="w-full px-4 py-2 border border-gray-200 dark:border-amoled-border rounded-lg bg-gray-50 dark:bg-amoled-input text-gray-900 dark:text-zinc-100 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition">
+                </div>
+                <div class="pt-4 flex gap-3">
+                    <button type="button" onclick="togglePasswordModal(false)" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 font-medium rounded-lg text-sm transition text-gray-700 dark:text-zinc-300">انصراف</button>
+                    <button type="button" onclick="savePassword()" id="save-password-btn" class="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition">ذخیره</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -1962,6 +2120,7 @@ const htmlTemplate = `
                 if (!res.ok) throw new Error();
                 const data = await res.json();
                 renderUsersUI(data);
+                setTimeout(applyFilters, 50);
             } catch (err) {
                 if (!silent) {
                     loadingState.innerHTML = '<span class="text-red-500">خطا در دریافت لیست کاربران از سرور</span>';
@@ -2075,7 +2234,7 @@ const htmlTemplate = `
                             '</div>';
                         }
 
-                                                                                                                                return '<tr class="hover:bg-gray-50 dark:hover:bg-zinc-900/40 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
+                                                                                                                                return '<tr data-username="' + user.username.toLowerCase() + '" data-active="' + user.is_active + '" class="user-row hover:bg-gray-50 dark:hover:bg-zinc-900/40 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
                                 '<td class="p-4">' +
                                     '<div class="flex flex-col gap-3">' +
                                         '<div class="flex items-center gap-2">' +
