@@ -22,6 +22,46 @@ const DOWNSTREAM_GRAIN_SILENT_MS = 1;
 const TCP_CONCURRENCY = 2;
 const PRELOAD_RACE_DIAL = true;
 
+// تولید ۹۹ آی‌پی تمیز کلودفلر شبه‌تصادفی و اختصاصی برای هر کاربر بر اساس نام کاربری
+function seededRandom(seedStr) {
+  let h = 0;
+  for (let i = 0; i < seedStr.length; i++) {
+    h = (h << 5) - h + seedStr.charCodeAt(i);
+    h |= 0;
+  }
+  let s = Math.abs(h);
+  return function() {
+    s = (s * 9301 + 49297) % 233280;
+    return s / 233280;
+  };
+}
+
+function get99CloudflareIPs(seedStr) {
+  const rnd = seededRandom(seedStr || 'default-seed');
+  const ips = [];
+  // 33 IPs from 104.16.0.0/12 (spans 104.16.x.y to 104.31.x.y)
+  for (let i = 0; i < 33; i++) {
+    const b2 = Math.floor(rnd() * 16) + 16;
+    const b3 = Math.floor(rnd() * 254) + 1;
+    const b4 = Math.floor(rnd() * 254) + 1;
+    ips.push(`104.${b2}.${b3}.${b4}`);
+  }
+  // 33 IPs from 172.64.0.0/13 (spans 172.64.x.y to 172.71.x.y)
+  for (let i = 0; i < 33; i++) {
+    const b2 = Math.floor(rnd() * 8) + 64;
+    const b3 = Math.floor(rnd() * 254) + 1;
+    const b4 = Math.floor(rnd() * 254) + 1;
+    ips.push(`172.${b2}.${b3}.${b4}`);
+  }
+  // 33 IPs from 188.114.96.0/20 (spans 188.114.96.y to 188.114.111.y)
+  for (let i = 0; i < 33; i++) {
+    const b3 = Math.floor(rnd() * 16) + 96;
+    const b4 = Math.floor(rnd() * 254) + 1;
+    ips.push(`188.114.${b3}.${b4}`);
+  }
+  return ips;
+}
+
 // ==========================================================
 // ۳. نقطه ورود اصلی ورکر (MAIN FETCH HANDLER)
 // ==========================================================
@@ -103,6 +143,8 @@ const Router = {
       subUser = subUser.slice(5);
     }
 
+    const isTest = url.searchParams.get('test') === '1';
+
     try {
       const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
       if (!user || user.connection_type !== atob('dmxlc3M=')) {
@@ -110,9 +152,9 @@ const Router = {
       }
 
       if (isJson) {
-        return await SubscriptionService.generateJson(user, host, env);
+        return await SubscriptionService.generateJson(user, host, env, isTest);
       } else {
-        return await SubscriptionService.generateText(user, host);
+        return await SubscriptionService.generateText(user, host, isTest);
       }
     } catch (err) {
       return new Response("Error building config: " + err.message, { status: 500 });
@@ -160,6 +202,7 @@ const Router = {
         tls: user.tls,
         port: user.port,
         ips: user.ips,
+        ip_seed: user.ip_seed,
         fingerprint: user.fingerprint || 'chrome'
       });
       const html = HTML_TEMPLATES.status.replace(
@@ -226,6 +269,37 @@ const Router = {
           "Set-Cookie": "panel_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax"
         }
       });
+    }
+
+    // API: چرخش سید آی‌پی‌های ۹۹ تایی کاربر (تولید رنج جدید)
+    if (url.pathname.startsWith('/api/public/users/') && url.pathname.endsWith('/rotate') && request.method === 'POST') {
+      const pathParts = url.pathname.split('/');
+      pathParts.pop(); // Remove 'rotate'
+      const username = decodeURIComponent(pathParts.pop());
+      
+      const user = await env.DB.prepare("SELECT username FROM users WHERE username = ?").bind(username).first();
+      if (!user) {
+        return new Response(JSON.stringify({ error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+      }
+      
+      const newSeed = crypto.randomUUID();
+      await env.DB.prepare("UPDATE users SET ip_seed = ?, ips = NULL WHERE username = ?").bind(newSeed, username).run();
+      return new Response(JSON.stringify({ success: true, ip_seed: newSeed }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    // API: بهینه‌سازی و ثبت آی‌پی‌های تمیز توسط کاربر (دسترسی عمومی بدون بررسی UUID)
+    if (url.pathname.startsWith('/api/public/users/') && request.method === 'POST') {
+      const pathParts = url.pathname.split('/');
+      const username = decodeURIComponent(pathParts.pop());
+      const { ips } = await request.json();
+      
+      const user = await env.DB.prepare("SELECT username FROM users WHERE username = ?").bind(username).first();
+      if (!user) {
+        return new Response(JSON.stringify({ error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+      }
+      
+      await env.DB.prepare("UPDATE users SET ips = ? WHERE username = ?").bind(ips || null, username).run();
+      return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
     }
 
     // بررسی عمومی احراز هویت برای بقیه APIها
@@ -367,9 +441,10 @@ const Router = {
             return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
           }
           const uuid = crypto.randomUUID();
+          const ipSeed = crypto.randomUUID();
           try {
             await env.DB.prepare(
-              "INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              "INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, ip_seed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ).bind(
               username, 
               uuid,
@@ -379,7 +454,8 @@ const Router = {
               atob('dmxlc3M='), 
               tls, 
               port,
-              fingerprint || 'chrome'
+              fingerprint || 'chrome',
+              ipSeed
             ).run();
             return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
           } catch (err) {
@@ -428,6 +504,7 @@ const DbService = {
     try { await db.prepare("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1").run(); } catch (e) {}
     try { await db.prepare("ALTER TABLE users ADD COLUMN last_active INTEGER").run(); } catch (e) {}
     try { await db.prepare("ALTER TABLE users ADD COLUMN fingerprint TEXT DEFAULT 'chrome'").run(); } catch (e) {}
+    try { await db.prepare("ALTER TABLE users ADD COLUMN ip_seed TEXT").run(); } catch (e) {}
     try { await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run(); } catch (e) {}
     schemaEnsured = true;
   },
@@ -470,11 +547,16 @@ const DbService = {
 // ۶. مدیریت تولید کانفیگ‌ها (SUBSCRIPTION SERVICE)
 // ==========================================================
 const SubscriptionService = {
-  async generateJson(user, host, env) {
-    let ips = [host];
-    if (user.ips) {
-      const parsedIps = user.ips.split('\n').map(ip => ip.trim()).filter(ip => ip.length > 0);
-      if (parsedIps.length > 0) ips = parsedIps;
+  async generateJson(user, host, env, isTest = false) {
+    let ips = [];
+    if (isTest) {
+      ips = get99CloudflareIPs(user.ip_seed || user.username);
+    } else {
+      ips = [host];
+      if (user.ips) {
+        const parsedIps = user.ips.split('\n').map(ip => ip.trim()).filter(ip => ip.length > 0);
+        if (parsedIps.length > 0) ips = parsedIps;
+      }
     }
     
     const ports = String(user.port || '443').split(',').map(p => p.trim()).filter(p => p.length > 0);
@@ -491,10 +573,13 @@ const SubscriptionService = {
 
     const configArray = [];
     ips.forEach((ip, ipIndex) => {
-      ports.forEach((portStr) => {
+      const activePorts = isTest ? [ports[ipIndex % (ports.length || 1)] || '443'] : ports;
+      activePorts.forEach((portStr) => {
         const isTlsPort = ['443', '2053', '2083', '2087', '2096', '8443'].includes(portStr);
         const tlsVal = isTlsPort ? 'tls' : 'none';
-        const remark = ips.length > 1 ? `${user.username} - IP ${ipIndex + 1} - Port ${portStr}` : `${user.username} - Port ${portStr}`;
+        const remark = isTest 
+          ? `${user.username}-Test-${ipIndex + 1}-${portStr}` 
+          : (ips.length > 1 ? `${user.username} - IP ${ipIndex + 1} - Port ${portStr}` : `${user.username} - Port ${portStr}`);
         
         const configObj = {
           remarks: remark,
@@ -592,23 +677,29 @@ const SubscriptionService = {
     });
   },
 
-  async generateText(user, host) {
-    let ips = [host];
-    if (user.ips) {
-      const parsedIps = user.ips.split('\n').map(ip => ip.trim()).filter(ip => ip.length > 0);
-      if (parsedIps.length > 0) ips = parsedIps;
+  async generateText(user, host, isTest = false) {
+    let ips = [];
+    if (isTest) {
+      ips = get99CloudflareIPs(user.ip_seed || user.username);
+    } else {
+      ips = [host];
+      if (user.ips) {
+        const parsedIps = user.ips.split('\n').map(ip => ip.trim()).filter(ip => ip.length > 0);
+        if (parsedIps.length > 0) ips = parsedIps;
+      }
     }
     const ports = String(user.port || '443').split(',').map(p => p.trim()).filter(p => p.length > 0);
     const fp = user.fingerprint || 'chrome';
     const links = [];
 
     ips.forEach((ip, ipIndex) => {
-      ports.forEach((portStr) => {
+      const activePorts = isTest ? [ports[ipIndex % (ports.length || 1)] || '443'] : ports;
+      activePorts.forEach((portStr) => {
         const isTlsPort = ['443', '2053', '2083', '2087', '2096', '8443'].includes(portStr);
         const tlsVal = isTlsPort ? 'tls' : 'none';
-        const remark = ips.length > 1 
-          ? `${user.username}-${ipIndex + 1}-${portStr}` 
-          : `${user.username}-${portStr}`;
+        const remark = isTest 
+          ? `${user.username}-Test-${ipIndex + 1}-${portStr}` 
+          : (ips.length > 1 ? `${user.username}-${ipIndex + 1}-${portStr}` : `${user.username}-${portStr}`);
         
         links.push(atob('dmxlc3M6Ly8=') + user.uuid + '@' + ip + ':' + portStr + '?path=%2F&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + '#' + encodeURIComponent(remark));
       });
@@ -2057,6 +2148,19 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
                         <textarea id="input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
                     </div>
 
+                    <!-- Quick Select by Config Number for Admin Panel -->
+                    <div id="admin-quick-select-card" class="p-3 bg-gray-50/50 dark:bg-zinc-900/30 border border-gray-200/60 dark:border-zinc-800 rounded-xl shadow-sm space-y-3">
+                        <label class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400">انتخاب سریع آی‌پی بر اساس شماره کانفیگ‌های ۹۹تایی:</label>
+                        <div class="flex gap-2">
+                            <input type="text" id="admin-working-numbers" placeholder="مثال: 3, 14, 55" class="flex-1 px-3 py-1.5 bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-xl text-xs font-mono focus:outline-none focus:ring-1 focus:ring-blue-500/50 transition">
+                            <button type="button" onclick="adminClearSelection()" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 font-semibold text-gray-700 dark:text-zinc-300 rounded-xl text-[10px] transition">پاک کردن</button>
+                            <button type="button" onclick="adminRotateIpSeed()" id="admin-rotate-btn" class="px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 font-semibold rounded-xl text-[10px] transition">🔄 جدید</button>
+                        </div>
+                        <div class="grid grid-cols-10 gap-1.5 max-h-[120px] overflow-y-auto pr-1 select-none font-mono text-[10px]" id="admin-grid-selector">
+                            <!-- Filled dynamically -->
+                        </div>
+                    </div>
+
                     <div>
                         <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">شبیه‌ساز اثر انگشت مرورگر (Fingerprint)</label>
                         <div class="relative">
@@ -2159,6 +2263,7 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
 
         let isEditMode = false;
         let editingUsername = '';
+        let editingUserIpSeed = '';
 
         function renderPortCheckboxes() {
             const tlsContainer = document.getElementById('tls-ports-list');
@@ -2223,10 +2328,12 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
                 card.classList.add('opacity-0', 'scale-95');
                 isEditMode = false;
                 editingUsername = '';
+                editingUserIpSeed = '';
                 document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
                 document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
                 document.getElementById('input-name').disabled = false;
                 document.getElementById('create-user-form').reset();
+                if (typeof adminClearSelection === 'function') adminClearSelection();
                 // Ensure port 443 remains checked as default when form is reset
                 const cb443 = document.querySelector('input[name="ports"][value="443"]');
                 if (cb443) cb443.checked = true;
@@ -2240,6 +2347,8 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
             document.getElementById('input-name').disabled = false;
             document.getElementById('create-user-form').reset();
+            const qCard = document.getElementById('admin-quick-select-card');
+            if (qCard) qCard.classList.add('hidden');
             toggleModal(true);
         }
 
@@ -2518,6 +2627,15 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
                                             'صفحه وضعیت' +
                                         '</button>' +
                                     '</div>' +
+                                    '<div class="flex gap-1">' +
+                                        '<button onclick="copyTestSubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded-lg text-xs font-bold transition border border-amber-200 dark:border-amber-800">' +
+                                            '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>' +
+                                            'ساب تست' +
+                                        '</button>' +
+                                        '<button onclick="tableRotateIpSeed(\\'' + encodeURIComponent(user.username) + '\\')" title="تغییر رنج آی‌پی‌ها (تولید رنج جدید)" class="px-2 py-1.5 bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded-lg text-xs font-bold transition border border-amber-200 dark:border-amber-800">' +
+                                            '🔄 رنج جدید' +
+                                        '</button>' +
+                                    '</div>' +
                                 '</div>' +
                             '</td>' +
                             '<td class="p-4 text-xs font-mono uppercase text-blue-500 font-semibold">VLESS</td>' +
@@ -2706,6 +2824,19 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             });
         }
 
+        function getTestSubLink(username) {
+            return window.location.origin + '/sub/' + encodeURIComponent(username) + '?test=1';
+        }
+
+        function copyTestSubLink(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            navigator.clipboard.writeText(getTestSubLink(username)).then(() => {
+                alert('✅ لینک ساب تست (۹۹ کانفیگ) با موفقیت کپی شد!');
+            }).catch(() => {
+                alert('خطا در کپی کردن لینک ساب تست!');
+            });
+        }
+
         function showSubQR(encodedUsername, type) {
             const username = decodeURIComponent(encodedUsername);
             if (type === 'normal') {
@@ -2857,6 +2988,7 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
 
             isEditMode = true;
             editingUsername = username;
+            editingUserIpSeed = user.ip_seed || username;
 
             document.getElementById('modal-title').innerText = 'ویرایش کاربر: ' + username;
             document.getElementById('submit-btn').innerText = 'ذخیره تغییرات';
@@ -2868,6 +3000,9 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             document.getElementById('input-limit').value = user.limit_gb || '';
             document.getElementById('input-expiry').value = user.expiry_days || '';
             document.getElementById('input-ips').value = user.ips || '';
+            const qCard = document.getElementById('admin-quick-select-card');
+            if (qCard) qCard.classList.remove('hidden');
+            if (typeof adminUpdateSetFromTextArea === 'function') adminUpdateSetFromTextArea();
 
             document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
 
@@ -3070,7 +3205,200 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             }
         }
 
+        // --- Quick IP selector helper logic inside admin panel ---
+        function get99CloudflareIPs(seedStr) {
+            var h = 0;
+            var seed = seedStr || 'default-seed';
+            for (var i = 0; i < seed.length; i++) {
+                h = (h << 5) - h + seed.charCodeAt(i);
+                h |= 0;
+            }
+            var s = Math.abs(h);
+            var rnd = function() {
+                s = (s * 9301 + 49297) % 233280;
+                return s / 233280;
+            };
+
+            const ips = [];
+            for (let i = 0; i < 33; i++) {
+                var b2 = Math.floor(rnd() * 16) + 16;
+                var b3 = Math.floor(rnd() * 254) + 1;
+                var b4 = Math.floor(rnd() * 254) + 1;
+                ips.push('104.' + b2 + '.' + b3 + '.' + b4);
+            }
+            for (let i = 0; i < 33; i++) {
+                var b2 = Math.floor(rnd() * 8) + 64;
+                var b3 = Math.floor(rnd() * 254) + 1;
+                var b4 = Math.floor(rnd() * 254) + 1;
+                ips.push('172.' + b2 + '.' + b3 + '.' + b4);
+            }
+            for (let i = 0; i < 33; i++) {
+                var b3 = Math.floor(rnd() * 16) + 96;
+                var b4 = Math.floor(rnd() * 254) + 1;
+                ips.push('188.114.' + b3 + '.' + b4);
+            }
+            return ips;
+        }
+
+        const adminSelectedNums = new Set();
+
+        function adminInitGridSelector() {
+            const container = document.getElementById('admin-grid-selector');
+            if (!container) return;
+            container.innerHTML = '';
+            for (let i = 1; i <= 99; i++) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.id = 'admin-grid-item-' + i;
+                btn.innerText = i;
+                btn.className = 'py-1.5 border border-gray-200 dark:border-zinc-800 rounded-lg bg-white/50 dark:bg-zinc-950 text-gray-500 dark:text-zinc-400 hover:border-blue-500 hover:text-blue-500 transition text-center cursor-pointer font-bold';
+                btn.onclick = () => adminToggleGridItem(i);
+                container.appendChild(btn);
+            }
+            
+            document.getElementById('admin-working-numbers').addEventListener('input', adminUpdateSetFromInput);
+            document.getElementById('input-ips').addEventListener('input', adminUpdateSetFromTextArea);
+        }
+
+        function adminToggleGridItem(num) {
+            const btn = document.getElementById('admin-grid-item-' + num);
+            if (!btn) return;
+            if (adminSelectedNums.has(num)) {
+                adminSelectedNums.delete(num);
+                btn.className = 'py-1.5 border border-gray-200 dark:border-zinc-800 rounded-lg bg-white/50 dark:bg-zinc-950 text-gray-500 dark:text-zinc-400 hover:border-blue-500 hover:text-blue-500 transition text-center cursor-pointer font-bold';
+            } else {
+                adminSelectedNums.add(num);
+                btn.className = 'py-1.5 border border-blue-500 bg-blue-500/10 text-blue-500 rounded-lg transition text-center cursor-pointer font-bold ring-1 ring-blue-500/20';
+            }
+            adminUpdateInputAndTextArea();
+        }
+
+        function adminUpdateInputAndTextArea() {
+            const sorted = Array.from(adminSelectedNums).sort((a, b) => a - b);
+            document.getElementById('admin-working-numbers').value = sorted.join(', ');
+            
+            const allIps = get99CloudflareIPs(editingUserIpSeed || editingUsername);
+            const selectedIps = sorted.map(num => allIps[num - 1]);
+            document.getElementById('input-ips').value = selectedIps.join('\\n');
+        }
+
+        function adminUpdateSetFromInput() {
+            const inputVal = document.getElementById('admin-working-numbers').value;
+            const parsed = inputVal.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n >= 1 && n <= 99);
+            
+            adminSelectedNums.forEach(num => {
+                const btn = document.getElementById('admin-grid-item-' + num);
+                if (btn) {
+                    btn.className = 'py-1.5 border border-gray-200 dark:border-zinc-800 rounded-lg bg-white/50 dark:bg-zinc-950 text-gray-500 dark:text-zinc-400 hover:border-blue-500 hover:text-blue-500 transition text-center cursor-pointer font-bold';
+                }
+            });
+            adminSelectedNums.clear();
+
+            parsed.forEach(num => {
+                adminSelectedNums.add(num);
+                const btn = document.getElementById('admin-grid-item-' + num);
+                if (btn) {
+                    btn.className = 'py-1.5 border border-blue-500 bg-blue-500/10 text-blue-500 rounded-lg transition text-center cursor-pointer font-bold ring-1 ring-blue-500/20';
+                }
+            });
+            
+            const allIps = get99CloudflareIPs(editingUserIpSeed || editingUsername);
+            const selectedIps = parsed.map(num => allIps[num - 1]);
+            document.getElementById('input-ips').value = selectedIps.join('\\n');
+        }
+
+        function adminUpdateSetFromTextArea() {
+            const textVal = document.getElementById('input-ips').value;
+            const currentIps = textVal.split('\\n').map(ip => ip.trim()).filter(ip => ip.length > 0);
+            const allIps = get99CloudflareIPs(editingUserIpSeed || editingUsername);
+            
+            adminSelectedNums.forEach(num => {
+                const btn = document.getElementById('admin-grid-item-' + num);
+                if (btn) {
+                    btn.className = 'py-1.5 border border-gray-200 dark:border-zinc-800 rounded-lg bg-white/50 dark:bg-zinc-950 text-gray-500 dark:text-zinc-400 hover:border-blue-500 hover:text-blue-500 transition text-center cursor-pointer font-bold';
+                }
+            });
+            adminSelectedNums.clear();
+
+            currentIps.forEach(ip => {
+                const idx = allIps.indexOf(ip);
+                if (idx !== -1) {
+                    adminSelectedNums.add(idx + 1);
+                    const btn = document.getElementById('admin-grid-item-' + (idx + 1));
+                    if (btn) {
+                        btn.className = 'py-1.5 border border-blue-500 bg-blue-500/10 text-blue-500 rounded-lg transition text-center cursor-pointer font-bold ring-1 ring-blue-500/20';
+                    }
+                }
+            });
+            
+            const sorted = Array.from(adminSelectedNums).sort((a, b) => a - b);
+            document.getElementById('admin-working-numbers').value = sorted.join(', ');
+        }
+
+        function adminClearSelection() {
+            adminSelectedNums.forEach(num => {
+                const btn = document.getElementById('admin-grid-item-' + num);
+                if (btn) {
+                    btn.className = 'py-1.5 border border-gray-200 dark:border-zinc-800 rounded-lg bg-white/50 dark:bg-zinc-950 text-gray-500 dark:text-zinc-400 hover:border-blue-500 hover:text-blue-500 transition text-center cursor-pointer font-bold';
+                }
+            });
+            adminSelectedNums.clear();
+            document.getElementById('admin-working-numbers').value = '';
+            document.getElementById('input-ips').value = '';
+        }
+
+        async function adminRotateIpSeed() {
+            if (!isEditMode || !editingUsername) return;
+            if (!confirm('⚠️ آیا می‌خواهید رنج ۹۹تایی این کاربر را تغییر دهید؟ آی‌پی‌های قبلی او پاک خواهند شد.')) return;
+            
+            const btn = document.getElementById('admin-rotate-btn');
+            btn.disabled = true;
+            btn.innerText = 'تغییر...';
+            
+            try {
+                const response = await fetch('/api/public/users/' + encodeURIComponent(editingUsername) + '/rotate', {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    alert('✅ رنج آی‌پی کاربر با موفقیت تغییر کرد و آی‌پی‌های او پاک شدند.');
+                    editingUserIpSeed = data.ip_seed;
+                    adminClearSelection();
+                    await loadUsers(true);
+                } else {
+                    alert('خطا در تغییر رنج آی‌پی');
+                }
+            } catch(e) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = '🔄 جدید';
+            }
+        }
+
+        async function tableRotateIpSeed(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            if (!confirm('⚠️ آیا می‌خواهید رنج ۹۹تایی کاربر ' + username + ' را تغییر دهید؟ آی‌پی‌های فعال قبلی او پاک خواهند شد.')) return;
+            
+            try {
+                const response = await fetch('/api/public/users/' + encodeURIComponent(username) + '/rotate', {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    alert('✅ رنج آی‌پی کاربر ' + username + ' با موفقیت تغییر کرد و آی‌پی‌های او پاک شدند.');
+                    await loadUsers(true);
+                } else {
+                    alert('خطا در تغییر رنج آی‌پی');
+                }
+            } catch(e) {
+                alert('خطا در ارتباط با سرور');
+            }
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
+            adminInitGridSelector();
             renderPortCheckboxes();
             loadUsers();
             loadLocations();
@@ -3125,45 +3453,43 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
         </div>
 
         <!-- Connection Status -->
-        <div id="status-card" class="mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 transition duration-300">
-            <span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
-        </div>
+        <div id="status-card" class="        <!-- Connection Optimizer (Stability Selector) -->
+        <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm mb-6 relative z-10">
+            <h2 class="text-sm font-bold mb-2 flex items-center gap-2 text-amber-500">
+                <svg class="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                بهینه‌ساز پایداری اتصال (انتخاب آی‌پی تمیز)
+            </h2>
+            <p class="text-[11px] text-gray-500 dark:text-zinc-400 mb-4 leading-relaxed">
+                ابتدا لینک ساب‌اسکریپشن تست (شامل ۹۹ کانفیگ) را کپی کنید و در نرم‌افزار خود پینگ بگیرید. سپس شماره کانفیگ‌های سالم را در کادر زیر وارد کنید تا فقط همان‌ها فعال شوند.
+            </p>
+            
+            <div class="space-y-4">
+                <button onclick="copyTestTextSub()" class="w-full flex justify-between items-center px-4 py-3 bg-amber-500/10 border border-amber-500/20 hover:border-amber-500/40 rounded-xl text-xs font-medium text-amber-600 dark:text-amber-400 transition shadow-sm">
+                    <span class="flex items-center gap-2">⚡ کپی لینک ساب‌اسکریپشن تست (۹۹ کانفیگ)</span>
+                    <span class="text-amber-500">کپی</span>
+                </button>
+                
+                <div class="border-t border-gray-200/50 dark:border-zinc-800/50 pt-4">
+                    <label class="block text-xs font-bold text-gray-700 dark:text-zinc-300 mb-2">شماره کانفیگ‌های سالم (با کاما جدا کنید):</label>
+                    <div class="flex gap-2">
+                        <input type="text" id="working-numbers-input" placeholder="مثال: 3, 14, 55" class="flex-1 px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-xl text-xs font-mono focus:border-amber-500 focus:outline-none transition">
+                        <button onclick="saveWorkingConfigs()" id="save-ips-btn" class="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs transition shadow-md shadow-amber-500/15">ثبت و اعمال</button>
+                    </div>
+                </div>
 
-        <!-- Progress Cards -->
-        <div class="space-y-5 mb-8 relative z-10">
-            <!-- Traffic usage card -->
-            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
-                <div class="flex justify-between items-center mb-3">
-                    <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
-                        <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-                        میزان حجم مصرفی
-                    </span>
-                    <span id="volume-pct" class="text-xs font-bold text-blue-500">۰٪</span>
-                </div>
-                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden mb-3">
-                    <div id="volume-progress" class="bg-blue-600 h-2.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
-                    <span>مصرف شده: <span id="used-vol" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
-                    <span>حجم کل: <span id="limit-vol" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
-                </div>
-            </div>
-
-            <!-- Expiry card -->
-            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
-                <div class="flex justify-between items-center mb-3">
-                    <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
-                        <svg class="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                        زمان باقی‌مانده اشتراک
-                    </span>
-                    <span id="expiry-pct" class="text-xs font-bold text-purple-500">۰٪</span>
-                </div>
-                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden mb-3 flex justify-end">
-                    <div id="expiry-progress" class="bg-purple-600 h-2.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
-                    <span>باقی‌مانده: <span id="days-remaining" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
-                    <span>کل اعتبار: <span id="total-days" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                <!-- 1-99 Grid Selector -->
+                <div class="border-t border-gray-200/50 dark:border-zinc-800/50 pt-3">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="text-[10px] text-gray-400 dark:text-zinc-500">یا مستقیماً روی شماره‌ها کلیک کنید:</span>
+                        <div class="flex gap-2">
+                            <button onclick="rotateIpSeed()" id="rotate-seed-btn" class="text-[10px] text-amber-500 hover:underline">🔄 تغییر رنج آی‌پی‌ها (تولید ۹۹تایی جدید)</button>
+                            <span class="text-gray-600">|</span>
+                            <button onclick="clearGridSelection()" class="text-[10px] text-red-500 hover:underline">پاک کردن همه</button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-10 gap-1.5 max-h-[145px] overflow-y-auto pr-1 select-none font-mono text-[10px]" id="grid-selector-container">
+                        <!-- Will be populated by JS -->
+                    </div>
                 </div>
             </div>
         </div>
@@ -3275,8 +3601,191 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب متنی کپی شد!'));
         }
 
+        function copyTestTextSub() {
+            const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username) + '?test=1';
+            navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب‌اسکریپشن تست (۹۹ کانفیگ) کپی شد!'));
+        }
+
         function showQR() {
             toggleQRModal(true, getVlessLink());
+        }
+
+        // --- Stability Optimizer Logic ---
+        function get99CloudflareIPs(seedStr) {
+            var h = 0;
+            var seed = seedStr || 'default-seed';
+            for (var i = 0; i < seed.length; i++) {
+                h = (h << 5) - h + seed.charCodeAt(i);
+                h |= 0;
+            }
+            var s = Math.abs(h);
+            var rnd = function() {
+                s = (s * 9301 + 49297) % 233280;
+                return s / 233280;
+            };
+
+            const ips = [];
+            for (let i = 0; i < 33; i++) {
+                var b2 = Math.floor(rnd() * 16) + 16;
+                var b3 = Math.floor(rnd() * 254) + 1;
+                var b4 = Math.floor(rnd() * 254) + 1;
+                ips.push('104.' + b2 + '.' + b3 + '.' + b4);
+            }
+            for (let i = 0; i < 33; i++) {
+                var b2 = Math.floor(rnd() * 8) + 64;
+                var b3 = Math.floor(rnd() * 254) + 1;
+                var b4 = Math.floor(rnd() * 254) + 1;
+                ips.push('172.' + b2 + '.' + b3 + '.' + b4);
+            }
+            for (let i = 0; i < 33; i++) {
+                var b3 = Math.floor(rnd() * 16) + 96;
+                var b4 = Math.floor(rnd() * 254) + 1;
+                ips.push('188.114.' + b3 + '.' + b4);
+            }
+            return ips;
+        }
+
+        const selectedNums = new Set();
+
+        function initGridSelector() {
+            const container = document.getElementById('grid-selector-container');
+            container.innerHTML = '';
+            for (let i = 1; i <= 99; i++) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.id = 'grid-item-' + i;
+                btn.innerText = i;
+                btn.className = 'py-1.5 border border-gray-200 dark:border-amoled-border rounded-lg bg-white/50 dark:bg-amoled-card text-gray-500 dark:text-zinc-400 hover:border-amber-500 hover:text-amber-500 transition text-center cursor-pointer font-bold';
+                btn.onclick = () => toggleGridItem(i);
+                container.appendChild(btn);
+            }
+        }
+
+        function toggleGridItem(num) {
+            const btn = document.getElementById('grid-item-' + num);
+            if (!btn) return;
+            if (selectedNums.has(num)) {
+                selectedNums.delete(num);
+                btn.className = 'py-1.5 border border-gray-200 dark:border-amoled-border rounded-lg bg-white/50 dark:bg-amoled-card text-gray-500 dark:text-zinc-400 hover:border-amber-500 hover:text-amber-500 transition text-center cursor-pointer font-bold';
+            } else {
+                selectedNums.add(num);
+                btn.className = 'py-1.5 border border-amber-500 bg-amber-500/10 text-amber-500 rounded-lg transition text-center cursor-pointer font-bold ring-1 ring-amber-500/20';
+            }
+            updateInputFromSet();
+        }
+
+        function updateInputFromSet() {
+            const sorted = Array.from(selectedNums).sort((a, b) => a - b);
+            document.getElementById('working-numbers-input').value = sorted.join(', ');
+        }
+
+        function updateSetFromInput() {
+            const inputVal = document.getElementById('working-numbers-input').value;
+            const parsed = inputVal.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n >= 1 && n <= 99);
+            
+            // Clear existing highlights
+            selectedNums.forEach(num => {
+                const btn = document.getElementById('grid-item-' + num);
+                if (btn) {
+                    btn.className = 'py-1.5 border border-gray-200 dark:border-amoled-border rounded-lg bg-white/50 dark:bg-amoled-card text-gray-500 dark:text-zinc-400 hover:border-amber-500 hover:text-amber-500 transition text-center cursor-pointer font-bold';
+                }
+            });
+            selectedNums.clear();
+
+            parsed.forEach(num => {
+                selectedNums.add(num);
+                const btn = document.getElementById('grid-item-' + num);
+                if (btn) {
+                    btn.className = 'py-1.5 border border-amber-500 bg-amber-500/10 text-amber-500 rounded-lg transition text-center cursor-pointer font-bold ring-1 ring-amber-500/20';
+                }
+            });
+        }
+
+        function clearGridSelection() {
+            selectedNums.forEach(num => {
+                const btn = document.getElementById('grid-item-' + num);
+                if (btn) {
+                    btn.className = 'py-1.5 border border-gray-200 dark:border-amoled-border rounded-lg bg-white/50 dark:bg-amoled-card text-gray-500 dark:text-zinc-400 hover:border-amber-500 hover:text-amber-500 transition text-center cursor-pointer font-bold';
+                }
+            });
+            selectedNums.clear();
+            document.getElementById('working-numbers-input').value = '';
+        }
+
+        async function rotateIpSeed() {
+            const u = window.statusUser;
+            if (!u) return;
+
+            if (!confirm('⚠️ آیا مطمئن هستید که می‌خواهید رنج آی‌پی‌های ۹۹ تایی خود را تغییر دهید؟ با این کار آی‌پی‌های سالم ثبت شده قبلی شما پاک خواهند شد و باید لیست جدید را دوباره پینگ و تست کنید.')) {
+                return;
+            }
+
+            const btn = document.getElementById('rotate-seed-btn');
+            btn.disabled = true;
+            btn.innerText = 'در حال تغییر رنج...';
+
+            try {
+                const response = await fetch('/api/public/users/' + encodeURIComponent(u.username) + '/rotate', {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    alert('✅ رنج آی‌پی با موفقیت تغییر کرد. لطفاً دوباره دکمه کپی لینک ساب‌اسکریپشن تست را بزنید و لیست ۹۹ تایی جدید را در کلاینت خود ایمپورت و پینگ کنید.');
+                    window.statusUser.ip_seed = data.ip_seed;
+                    window.statusUser.ips = null;
+                    clearGridSelection();
+                } else {
+                    alert('خطا در تغییر رنج آی‌پی');
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = '🔄 تغییر رنج آی‌پی‌ها (تولید ۹۹تایی جدید)';
+            }
+        }
+
+        async function saveWorkingConfigs() {
+            const u = window.statusUser;
+            if (!u) return;
+
+            const inputVal = document.getElementById('working-numbers-input').value;
+            const parsed = inputVal.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n >= 1 && n <= 99);
+            
+            if (parsed.length === 0) {
+                alert('⚠️ لطفا حداقل یک شماره کانفیگ سالم وارد کنید (بین ۱ تا ۹۹)');
+                return;
+            }
+
+            const allIps = get99CloudflareIPs(u.ip_seed || u.username);
+            const selectedIps = parsed.map(num => allIps[num - 1]);
+            const ipsString = selectedIps.join('\\n');
+
+            const btn = document.getElementById('save-ips-btn');
+            btn.disabled = true;
+            btn.innerText = 'در حال ذخیره...';
+
+            try {
+                const response = await fetch('/api/public/users/' + encodeURIComponent(u.username), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ips: ipsString })
+                });
+
+                if (response.ok) {
+                    alert('✅ آی‌پی‌های سالم با موفقیت روی اشتراک شما اعمال شدند. فیلترشکن خود را بروزرسانی (Update Subscription) کنید.');
+                    window.statusUser.ips = ipsString;
+                } else {
+                    const err = await response.json();
+                    alert('خطا: ' + (err.error || 'عملیات ناموفق بود'));
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'ثبت و اعمال';
+            }
         }
 
         document.addEventListener('DOMContentLoaded', () => {
@@ -3284,6 +3793,26 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             if (!u) return;
 
             document.getElementById('display-username').innerText = '@' + u.username;
+
+            // Initialize stability optimizer
+            initGridSelector();
+            document.getElementById('working-numbers-input').addEventListener('input', updateSetFromInput);
+
+            if (u.ips) {
+                const currentIps = u.ips.split('\\n').map(ip => ip.trim()).filter(ip => ip.length > 0);
+                const allIps = get99CloudflareIPs(u.ip_seed || u.username);
+                currentIps.forEach(ip => {
+                    const idx = allIps.indexOf(ip);
+                    if (idx !== -1) {
+                        selectedNums.add(idx + 1);
+                        const btn = document.getElementById('grid-item-' + (idx + 1));
+                        if (btn) {
+                            btn.className = 'py-1.5 border border-amber-500 bg-amber-500/10 text-amber-500 rounded-lg transition text-center cursor-pointer font-bold ring-1 ring-amber-500/20';
+                        }
+                    }
+                });
+                updateInputFromSet();
+            }
 
             // Compute volume
             const usedGb = u.used_gb || 0;
