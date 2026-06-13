@@ -37,11 +37,20 @@
       font-family: var(--font-family);
     }
 
+    html {
+      overflow-x: hidden;
+      overflow-y: auto;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+    }
+
     body {
       background-color: var(--bg-color);
       color: var(--text-main);
       min-height: 100vh;
-      overflow-x: hidden;
+      overflow: visible;
+      width: 100%;
       position: relative;
       padding: 2rem 1rem;
       background-image: 
@@ -72,6 +81,7 @@
     }
 
     .container {
+      width: 100%;
       max-width: 1000px;
       margin: 0 auto;
       display: flex;
@@ -124,6 +134,7 @@
       font-weight: 700;
       background: linear-gradient(135deg, #fff 30%, var(--text-muted) 100%);
       -webkit-background-clip: text;
+      background-clip: text;
       -webkit-text-fill-color: transparent;
       margin-bottom: 0.25rem;
     }
@@ -197,6 +208,7 @@
 
     select, input[type="number"], textarea, input[type="text"] {
       width: 100%;
+      max-width: 100%;
       background: rgba(10, 15, 30, 0.8);
       border: 1px solid var(--card-border);
       border-radius: 12px;
@@ -205,6 +217,9 @@
       font-size: 0.9rem;
       transition: all 0.3s ease;
       outline: none;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      overflow: hidden;
     }
 
     select:focus, input[type="number"]:focus, textarea:focus, input[type="text"]:focus {
@@ -217,6 +232,8 @@
       display: flex;
       align-items: center;
       gap: 1rem;
+      width: 100%;
+      min-width: 0;
     }
 
     .slider-val {
@@ -229,7 +246,9 @@
     }
 
     input[type="range"] {
-      flex-grow: 1;
+      flex: 1;
+      width: 100%;
+      min-width: 0;
       accent-color: var(--accent-cyan);
       background: rgba(255, 255, 255, 0.1);
       height: 6px;
@@ -517,6 +536,126 @@
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
+
+    /* Mobile and Responsive Optimizations */
+    .config-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .actions-flex {
+      display: flex;
+      gap: 0.4rem;
+    }
+
+    #qrcode img, #qrcode canvas {
+      max-width: 100%;
+      height: auto !important;
+    }
+
+    @media (max-width: 580px) {
+      body {
+        padding: 1rem 0.5rem;
+      }
+      .orb {
+        display: none !important;
+      }
+      .container {
+        width: 100%;
+        max-width: 100%;
+        gap: 1rem;
+      }
+      header {
+        padding: 1.25rem 1rem;
+        border-radius: 16px;
+      }
+      h1 {
+        font-size: 1.35rem;
+      }
+      .logo-container {
+        padding: 0.75rem;
+        margin-bottom: 0.5rem;
+        border-radius: 16px;
+      }
+      .card {
+        padding: 1rem;
+        border-radius: 16px;
+        gap: 1rem;
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
+      }
+      .form-group .btn {
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
+      }
+      th, td {
+        padding: 0.5rem 0.35rem;
+        font-size: 0.75rem;
+      }
+      .ip-col {
+        font-size: 0.75rem;
+        word-break: break-all;
+      }
+      .latency-col {
+        font-size: 0.75rem;
+        white-space: nowrap;
+      }
+      .rating-badge {
+        font-size: 0.65rem;
+        padding: 0.1rem 0.3rem;
+        margin-right: 0.25rem !important;
+      }
+      
+      .actions-flex {
+        flex-direction: column;
+        gap: 0.25rem !important;
+      }
+      .actions-flex .btn {
+        width: 100%;
+        padding: 0.3rem 0.4rem !important;
+        font-size: 0.7rem !important;
+        border-radius: 6px;
+      }
+
+      .actions-bar {
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+      .actions-bar .btn {
+        width: 100%;
+        font-size: 0.8rem;
+        padding: 0.6rem 1rem;
+      }
+
+      .config-actions {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.5rem;
+      }
+      .config-actions .btn {
+        width: 100%;
+        font-size: 0.8rem;
+        padding: 0.6rem 1rem;
+      }
+      #quick-links {
+        width: 100%;
+        justify-content: space-between;
+        gap: 0.5rem;
+      }
+      #quick-links .btn {
+        flex: 1;
+      }
+      
+      .modal-content {
+        padding: 1rem;
+        border-radius: 16px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -671,7 +810,7 @@
             کانفیگ VLESS خود را در کادر زیر وارد کنید. سپس پس از پیدا شدن آی‌پی‌ها، با کلیک روی نماد اعمال در جدول یا دکمه زیر، کانفیگ با آی‌پی جدید بروزرسانی خواهد شد.
           </p>
           <textarea id="config-input" class="config-textarea" placeholder="vless://e123..."></textarea>
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
+          <div class="config-actions">
             <button id="btn-update-config" class="btn btn-outline btn-sm" onclick="updateConfigWithBestIP()" disabled>
               اعمال بهترین آی‌پی روی کانفیگ
             </button>
@@ -1024,7 +1163,7 @@
           <td class="ip-col">${item.ip}</td>
           <td class="latency-col ${latClass}">${item.latency}ms <span class="rating-badge ${ratingClass}" style="margin-right:0.5rem; font-weight:normal;">${ratingText}</span></td>
           <td>
-            <div style="display:flex; gap:0.4rem;">
+            <div class="actions-flex">
               <button class="btn btn-outline btn-sm" onclick="copyText('${item.ip}')" style="padding:0.25rem 0.5rem;">کپی</button>
               <button class="btn btn-primary btn-sm" onclick="applyIPToConfig('${item.ip}')" style="padding:0.25rem 0.5rem; font-size:0.75rem;">اعمال روی کانفیگ</button>
             </div>
