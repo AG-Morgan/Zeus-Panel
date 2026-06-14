@@ -86,7 +86,7 @@ const Router = {
       } catch (e) {}
 
       const mockStoredData = { proxy_ip: proxyIP };
-          return handleVLESS(env, mockStoredData, ctx);
+          return handleVLESS(env, mockStoredData, ctx, request);
         } catch (e) {
       return new Response("Internal Server Error", { status: 500 });
     }
@@ -160,7 +160,8 @@ const Router = {
         tls: user.tls,
         port: user.port,
         ips: user.ips,
-        fingerprint: user.fingerprint || 'chrome'
+        fingerprint: user.fingerprint || 'chrome',
+        ip_limit: user.ip_limit
       });
       const html = HTML_TEMPLATES.status.replace(
         "/* {{USER_DATA_PLACEHOLDER}} */",
@@ -341,9 +342,9 @@ const Router = {
             ).bind(username).run();
             return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
           } else {
-            const { limit_gb, expiry_days, ips, tls, port, fingerprint } = body;
+            const { limit_gb, expiry_days, ips, tls, port, fingerprint, ip_limit } = body;
             await env.DB.prepare(
-              "UPDATE users SET limit_gb = ?, expiry_days = ?, ips = ?, tls = ?, port = ?, fingerprint = ? WHERE username = ?"
+              "UPDATE users SET limit_gb = ?, expiry_days = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, ip_limit = ? WHERE username = ?"
             ).bind(
               limit_gb ? parseFloat(limit_gb) : null, 
               expiry_days ? parseInt(expiry_days) : null, 
@@ -351,6 +352,7 @@ const Router = {
               tls, 
               port, 
               fingerprint || 'chrome',
+              ip_limit ? parseInt(ip_limit) : null,
               username
             ).run();
             return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
@@ -381,14 +383,14 @@ const Router = {
         }
 
         if (request.method === 'POST') {
-          const { username, limit_gb, expiry_days, ips, tls, port, fingerprint } = await request.json();
+          const { username, limit_gb, expiry_days, ips, tls, port, fingerprint, ip_limit } = await request.json();
           if (!username) {
             return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
           }
           const uuid = crypto.randomUUID();
           try {
             await env.DB.prepare(
-              "INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              "INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, ip_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ).bind(
               username, 
               uuid,
@@ -398,7 +400,8 @@ const Router = {
               atob('dmxlc3M='), 
               tls, 
               port,
-              fingerprint || 'chrome'
+              fingerprint || 'chrome',
+              ip_limit ? parseInt(ip_limit) : null
             ).run();
             return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
           } catch (err) {
@@ -447,6 +450,8 @@ const DbService = {
     try { await db.prepare("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1").run(); } catch (e) {}
     try { await db.prepare("ALTER TABLE users ADD COLUMN last_active INTEGER").run(); } catch (e) {}
     try { await db.prepare("ALTER TABLE users ADD COLUMN fingerprint TEXT DEFAULT 'chrome'").run(); } catch (e) {}
+    try { await db.prepare("ALTER TABLE users ADD COLUMN ip_limit INTEGER DEFAULT NULL").run(); } catch (e) {}
+    try { await db.prepare("ALTER TABLE users ADD COLUMN active_ips TEXT DEFAULT NULL").run(); } catch (e) {}
     try { await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run(); } catch (e) {}
     schemaEnsured = true;
   },
@@ -695,7 +700,8 @@ async function flushExpiredTraffic(env) {
   }
 }
 
-async function handleVLESS(env, storedData = null, ctx = null) {
+async function handleVLESS(env, storedData = null, ctx = null, request = null) {
+  const clientIP = request ? (request.headers.get("CF-Connecting-IP") || "unknown") : "unknown";
   const socketPair = new WebSocketPair();
   const [clientSock, serverSock] = Object.values(socketPair);
   serverSock.accept();
@@ -708,6 +714,7 @@ async function handleVLESS(env, storedData = null, ctx = null) {
   function addBytes(bytes) {
     if (bytes <= 0 || !username) return;
     
+
     let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
     current += bytes;
     
@@ -749,6 +756,31 @@ async function handleVLESS(env, storedData = null, ctx = null) {
     const uname = username;
     if (!uname) return;
 
+    if (clientIP && clientIP !== "unknown" && validUUID) {
+      const removeIpTask = async () => {
+        try {
+          const user = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
+          if (user && user.active_ips) {
+            let activeIps = JSON.parse(user.active_ips || '{}');
+            if (activeIps[clientIP]) {
+              if (typeof activeIps[clientIP] === 'object') {
+                activeIps[clientIP].count = (activeIps[clientIP].count || 1) - 1;
+                if (activeIps[clientIP].count <= 0) {
+                  delete activeIps[clientIP];
+                }
+              } else {
+                delete activeIps[clientIP];
+              }
+              await env.DB.prepare("UPDATE users SET active_ips = ? WHERE uuid = ?")
+                .bind(JSON.stringify(activeIps), validUUID).run();
+            }
+          }
+        } catch (e) {}
+      };
+      if (ctx) ctx.waitUntil(removeIpTask());
+      else removeIpTask();
+    }
+
     let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 1;
     activeCount = activeCount - 1;
     
@@ -788,9 +820,11 @@ async function handleVLESS(env, storedData = null, ctx = null) {
         tickCount++;
         if (tickCount >= 4) {
           tickCount = 0;
-          const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, expiry_days, created_at FROM users WHERE uuid = ?").bind(validUUID).first();
+          const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
           
           let isExpired = false;
+          let isIpLimitExpired = false;
+          let updatedActiveIps = null;
           if (!user || user.is_active === 0) {
             isExpired = true;
           } else {
@@ -804,6 +838,51 @@ async function handleVLESS(env, storedData = null, ctx = null) {
                 isExpired = true;
               }
             }
+            
+            // Heartbeat IP Limit enforcement (Database-Backed)
+            if (!isExpired && user.ip_limit && user.ip_limit > 0 && clientIP && clientIP !== "unknown") {
+              let activeIps = {};
+              try {
+                activeIps = JSON.parse(user.active_ips || '{}');
+              } catch (e) {}
+              
+              // Clean up expired (no activity for 90 seconds)
+              const nowTime = Date.now();
+              for (const [ip, data] of Object.entries(activeIps)) {
+                const lastSeen = (data && typeof data === 'object') ? data.timestamp : data;
+                if (nowTime - lastSeen > 90000) {
+                  delete activeIps[ip];
+                }
+              }
+              
+              // Sort active IPs by last seen timestamp descending (newest first)
+              const sortedIps = Object.keys(activeIps).sort((a, b) => {
+                const tA = (activeIps[a] && typeof activeIps[a] === 'object') ? activeIps[a].timestamp : activeIps[a];
+                const tB = (activeIps[b] && typeof activeIps[b] === 'object') ? activeIps[b].timestamp : activeIps[b];
+                return tB - tA;
+              });
+              
+              // Find the index of the current client IP in the sorted list
+              const clientIpIndex = sortedIps.indexOf(clientIP);
+              
+              if (clientIpIndex === -1) {
+                if (sortedIps.length >= user.ip_limit) {
+                  isIpLimitExpired = true;
+                } else {
+                  activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+                  updatedActiveIps = JSON.stringify(activeIps);
+                }
+              } else if (clientIpIndex >= user.ip_limit) {
+                isIpLimitExpired = true;
+              } else {
+                if (typeof activeIps[clientIP] === 'object') {
+                  activeIps[clientIP].timestamp = nowTime;
+                } else {
+                  activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+                }
+                updatedActiveIps = JSON.stringify(activeIps);
+              }
+            }
           }
 
           if (isExpired) {
@@ -813,11 +892,21 @@ async function handleVLESS(env, storedData = null, ctx = null) {
             return;
           }
 
+          if (isIpLimitExpired) {
+            clearInterval(heartbeat);
+            closeSocketQuietly(serverSock);
+            return;
+          }
+
           const now = Date.now();
           const lastRecorded = GLOBAL_LAST_ACTIVE_WRITE.get(username) || 0;
           if (now - lastRecorded > 60000) {
             GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-            await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+            if (updatedActiveIps) {
+              await env.DB.prepare("UPDATE users SET last_active = ?, active_ips = ? WHERE username = ?").bind(now, updatedActiveIps, username).run();
+            } else {
+              await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+            }
           }
         }
       } catch (e) {}
@@ -922,6 +1011,49 @@ async function handleVLESS(env, storedData = null, ctx = null) {
           serverSock.close();
           return;
         }
+      }
+
+      // Check IP Limit (Database-Backed)
+      if (user.ip_limit && user.ip_limit > 0 && clientIP && clientIP !== "unknown") {
+        let activeIps = {};
+        try {
+          activeIps = JSON.parse(user.active_ips || '{}');
+        } catch (e) {}
+        
+        // Clean up expired IPs (no activity for 90 seconds)
+        const now = Date.now();
+        for (const [ip, data] of Object.entries(activeIps)) {
+          const lastSeen = (data && typeof data === 'object') ? data.timestamp : data;
+          if (now - lastSeen > 90000) {
+            delete activeIps[ip];
+          }
+        }
+        
+        if (!activeIps[clientIP]) {
+          const sortedIps = Object.keys(activeIps).sort((a, b) => {
+            const tA = (activeIps[a] && typeof activeIps[a] === 'object') ? activeIps[a].timestamp : activeIps[a];
+            const tB = (activeIps[b] && typeof activeIps[b] === 'object') ? activeIps[b].timestamp : activeIps[b];
+            return tB - tA;
+          });
+          if (sortedIps.length >= user.ip_limit) {
+            // Block new connection if limit reached (Strict security)
+            serverSock.close();
+            return;
+          }
+          activeIps[clientIP] = { timestamp: now, count: 1 };
+        } else {
+          if (typeof activeIps[clientIP] === 'object') {
+            activeIps[clientIP].timestamp = now;
+            activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
+          } else {
+            activeIps[clientIP] = { timestamp: now, count: 1 };
+          }
+        }
+        
+        try {
+          await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?")
+            .bind(JSON.stringify(activeIps), now, reqUUID).run();
+        } catch (e) {}
       }
 
       validUUID = reqUUID;
@@ -2084,23 +2216,32 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
                         </div>
                     </div>
 
-                    <div class="grid grid-cols-2 gap-4">
+                    <div class="grid grid-cols-3 gap-4">
                         <div>
-                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">حجم مجاز (GB)</label>
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider text-ellipsis overflow-hidden whitespace-nowrap">حجم (GB)</label>
                             <div class="relative">
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
                                 </span>
-                                <input type="number" id="input-limit" min="0" step="any" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                <input type="number" id="input-limit" min="0" step="any" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition text-center sm:text-right">
                             </div>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">مدت اعتبار (روز)</label>
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider text-ellipsis overflow-hidden whitespace-nowrap">اعتبار (روز)</label>
                             <div class="relative">
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                                 </span>
-                                <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition text-center sm:text-right">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider text-ellipsis overflow-hidden whitespace-nowrap">محدودیت IP</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                                </span>
+                                <input type="number" id="input-ip-limit" min="1" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition text-center sm:text-right">
                             </div>
                         </div>
                     </div>
@@ -2829,6 +2970,7 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
                                         '<span class="font-bold text-gray-900 dark:text-zinc-100">' + user.username + '</span>' +
                                         (user.is_active === 0 ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 rounded-md">قطع</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 rounded-md">فعال</span>') +
                                         (user.is_online === 1 ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-emerald-500 text-white rounded-md animate-pulse">● آنلاین</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded-md">آفلاین</span>') +
+                                        (user.ip_limit ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400 rounded-md">محدودیت IP: ' + user.ip_limit + '</span>' : '') +
                                     '</div>' +
                                     '<div class="flex gap-1.5">' +
                                         '<button onclick="copyConfig(\\'' + encodeURIComponent(user.username) + '\\')" title="کپی کانفیگ" class="p-1.5 bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-md transition shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
@@ -2891,6 +3033,7 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             const username = document.getElementById('input-name').value;
             const limit = document.getElementById('input-limit').value || null;
             const expiry = document.getElementById('input-expiry').value || null;
+            const ipLimit = document.getElementById('input-ip-limit').value || null;
             
             // Gather multiple selected ports
             const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value);
@@ -2916,7 +3059,7 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
                 const response = await fetch(url, {
                     method: method,
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, tls, port, ips, fingerprint })
+                    body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, tls, port, ips, fingerprint, ip_limit: ipLimit })
                 });
                 
                 if (response.ok) {
@@ -3206,6 +3349,7 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
 
             document.getElementById('input-limit').value = user.limit_gb || '';
             document.getElementById('input-expiry').value = user.expiry_days || '';
+            document.getElementById('input-ip-limit').value = user.ip_limit || '';
             document.getElementById('input-ips').value = user.ips || '';
 
             document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
@@ -3572,8 +3716,14 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
         </div>
 
         <!-- Connection Status -->
-        <div id="status-card" class="mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 transition duration-300">
+        <div id="status-card" class="mb-4 rounded-2xl p-4 text-center border font-bold relative z-10 transition duration-300">
             <span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
+        </div>
+
+        <!-- IP Limit Status -->
+        <div id="ip-limit-card" class="mb-6 rounded-2xl p-3 text-center border font-semibold relative z-10 text-xs flex items-center justify-center gap-1.5 transition duration-300">
+            <span id="ip-limit-icon">🔓</span>
+            <span id="ip-limit-text">محدودیت اتصال: در حال بارگذاری...</span>
         </div>
 
         <!-- Progress Cards -->
@@ -3729,6 +3879,20 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             if (!u) return;
 
             document.getElementById('display-username').innerText = '@' + u.username;
+
+            // Set IP Limit Display
+            const ipLimitCard = document.getElementById('ip-limit-card');
+            const ipLimitIcon = document.getElementById('ip-limit-icon');
+            const ipLimitText = document.getElementById('ip-limit-text');
+            if (u.ip_limit) {
+                ipLimitCard.className = 'mb-6 rounded-2xl p-3 text-center border font-semibold relative z-10 text-xs flex items-center justify-center gap-1.5 bg-purple-500/10 border-purple-500/30 text-purple-500 shadow-md shadow-purple-500/5';
+                ipLimitIcon.innerText = '🔒';
+                ipLimitText.innerText = 'محدودیت اتصال: ' + u.ip_limit + ' دستگاه همزمان';
+            } else {
+                ipLimitCard.className = 'mb-6 rounded-2xl p-3 text-center border font-semibold relative z-10 text-xs flex items-center justify-center gap-1.5 bg-white/40 dark:bg-zinc-900/30 border-gray-250 dark:border-amoled-border text-gray-500 dark:text-zinc-400';
+                ipLimitIcon.innerText = '🔓';
+                ipLimitText.innerText = 'محدودیت اتصال: بدون محدودیت';
+            }
 
             // Compute volume
             const usedGb = u.used_gb || 0;
